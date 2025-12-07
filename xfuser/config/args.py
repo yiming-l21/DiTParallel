@@ -93,6 +93,7 @@ class xFuserArgs:
     width: int = 1024
     num_frames: int = 49
     num_inference_steps: int = 20
+    guidance_scale: float = 6
     max_sequence_length: int = 256
     img_file_path: Optional[str] = None
     prompt: Union[str, List[str]] = ""
@@ -100,7 +101,6 @@ class xFuserArgs:
     no_use_resolution_binning: bool = False
     seed: int = 42
     output_type: str = "pil"
-    guidance_scale: float = 3.5
     enable_model_cpu_offload: bool = False
     enable_sequential_cpu_offload: bool = False
     enable_tiling: bool = False
@@ -282,6 +282,12 @@ class xFuserArgs:
             default=256,
             help="Max sequencen length of prompt",
         )
+        input_group.add_argument(
+            "--guidance_scale",
+            type=float,
+            default=6,
+            help="Guidance scale for classifier-free guidance.",
+        )
         runtime_group.add_argument(
             "--seed", type=int, default=42, help="Random seed for operations."
         )
@@ -290,12 +296,6 @@ class xFuserArgs:
             type=str,
             default="pil",
             help="Output type of the pipeline.",
-        )
-        input_group.add_argument(
-            "--guidance_scale",
-            type=float,
-            default=3.5,
-            help="Guidance scale for classifier free guidance.",
         )
         runtime_group.add_argument(
             "--enable_sequential_cpu_offload",
@@ -457,9 +457,9 @@ class xFuserArgs:
             negative_prompt=self.negative_prompt,
             num_inference_steps=self.num_inference_steps,
             max_sequence_length=self.max_sequence_length,
+            guidance_scale=self.guidance_scale,
             seed=self.seed,
             output_type=self.output_type,
-            guidance_scale=self.guidance_scale,
         )
 
         return engine_config, input_config

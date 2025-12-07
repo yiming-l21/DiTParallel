@@ -10,7 +10,7 @@ declare -A MODEL_CONFIGS=(
     ["Pixart-alpha"]="pixartalpha_example.py /cfs/dit/PixArt-XL-2-1024-MS 20"
     ["Pixart-sigma"]="pixartsigma_example.py /cfs/dit/PixArt-Sigma-XL-2-2K-MS 20"
     ["Sd3"]="sd3_example.py /cfs/dit/stable-diffusion-3-medium-diffusers 20"
-    ["Flux"]="flux_example.py /cfs/dit/FLUX.1-dev/ 28"
+    ["Flux"]="flux_example.py /export/home/liuyiming54/flux-dev 28"
     ["FluxControl"]="flux_control_example.py /cfs/dit/FLUX.1-Depth-dev/ 28"
     ["HunyuanDiT"]="hunyuandit_example.py /cfs/dit/HunyuanDiT-v1.2-Diffusers 50"
     ["SDXL"]="sdxl_example.py /cfs/dit/stable-diffusion-xl-base-1.0 30"
@@ -35,7 +35,7 @@ TASK_ARGS="--height 1024 --width 1024 --no_use_resolution_binning --guidance_sca
 
 # On 8 gpus, pp=2, ulysses=2, ring=1, cfg_parallel=2 (split batch)
 N_GPUS=8
-PARALLEL_ARGS="--pipefusion_parallel_degree 2 --ulysses_degree 2 --ring_degree 2"
+PARALLEL_ARGS="--pipefusion_parallel_degree 8 --ulysses_degree 1 --ring_degree 1"
 
 # CFG_ARGS="--use_cfg_parallel"
 
@@ -56,7 +56,7 @@ PARALLEL_ARGS="--pipefusion_parallel_degree 2 --ulysses_degree 2 --ring_degree 2
 
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
 
-torchrun --nproc_per_node=$N_GPUS ./examples/$SCRIPT \
+python -m torch.distributed.run --nproc_per_node=$N_GPUS ./examples-1/$SCRIPT \
 --model $MODEL_ID \
 $PARALLEL_ARGS \
 $TASK_ARGS \

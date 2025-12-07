@@ -7,7 +7,6 @@ from typing import List, Optional
 
 import torch
 import torch.distributed
-from torch.cuda import set_device, device_count
 import xfuser.envs as envs
 from xfuser.logger import init_logger
 from .group_coordinator import (
@@ -15,18 +14,6 @@ from .group_coordinator import (
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
 )
-
-try:
-    import torch_musa
-    from torch_musa.core.device import set_device, device_count
-except ModuleNotFoundError:
-    pass
-
-try:
-    from torch.npu import set_device, device_count
-except ModuleNotFoundError:
-    pass
-
 from .utils import RankGenerator
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
@@ -44,7 +31,6 @@ _CFG: Optional[GroupCoordinator] = None
 _DP: Optional[GroupCoordinator] = None
 _DIT: Optional[GroupCoordinator] = None
 _VAE: Optional[GroupCoordinator] = None
-
 
 # * QUERY
 def get_world_group() -> GroupCoordinator:
@@ -169,33 +155,26 @@ def is_dp_last_group():
         and get_pipeline_parallel_rank() == (get_pipeline_parallel_world_size() - 1)
     )
 
-
 def get_dit_world_size():
     """Return world size for the DiT model (excluding VAE)."""
-    return (
-        get_data_parallel_world_size()
-        * get_classifier_free_guidance_world_size()
-        * get_sequence_parallel_world_size()
-        * get_pipeline_parallel_world_size()
-        * get_tensor_model_parallel_world_size()
-    )
-
+    return (get_data_parallel_world_size() *
+            get_classifier_free_guidance_world_size() *
+            get_sequence_parallel_world_size() *
+            get_pipeline_parallel_world_size() *
+            get_tensor_model_parallel_world_size())
 
 # Add VAE getter functions
 def get_vae_parallel_group() -> GroupCoordinator:
     assert _VAE is not None, "VAE parallel group is not initialized"
     return _VAE
 
-
 def get_vae_parallel_world_size():
     """Return world size for the VAE parallel group."""
     return get_vae_parallel_group().world_size
 
-
 def get_vae_parallel_rank():
     """Return my rank for the VAE parallel group."""
     return get_vae_parallel_group().rank_in_group
-
 
 # * SET
 
@@ -215,10 +194,8 @@ def init_distributed_environment(
     rank: int = -1,
     distributed_init_method: str = "env://",
     local_rank: int = -1,
-    backend: Optional[str] = None,
+    backend: str = "nccl",
 ):
-    if backend is None:
-        backend = envs.get_torch_distributed_backend()
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
         world_size,
@@ -239,7 +216,7 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
         )
-        set_device(torch.distributed.get_rank() % device_count())
+        torch.cuda.set_device(torch.distributed.get_rank() % torch.cuda.device_count())
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -258,7 +235,6 @@ def init_distributed_environment(
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
-
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
@@ -305,21 +281,18 @@ def init_model_parallel_group(
             torch_distributed_backend=backend,
         )
 
-
 def init_dit_group(
     dit_parallel_size: int,
     backend: str,
 ):
     global _DIT
     _DIT = torch.distributed.new_group(
-        ranks=list(range(dit_parallel_size)), backend=backend
-    )
-
+                ranks=list(range(dit_parallel_size)), backend=backend
+            )
 
 def get_dit_group():
     assert _DIT is not None, "DIT group is not initialized"
     return _DIT
-
 
 def init_vae_group(
     dit_parallel_size: int,
@@ -330,13 +303,14 @@ def init_vae_group(
     global _VAE
     assert _VAE is None, "VAE parallel group is already initialized"
     vae_ranks = list(range(dit_parallel_size, dit_parallel_size + vae_parallel_size))
-    _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
-
+    _VAE = torch.distributed.new_group(
+                ranks=vae_ranks, backend=backend
+            )
 
 def initialize_model_parallel(
     data_parallel_degree: int = 1,
     classifier_free_guidance_degree: int = 1,
-    sequence_parallel_degree: Optional[int] = None,
+    sequence_parallel_degree: int = 1,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     tensor_parallel_degree: int = 1,
@@ -344,15 +318,13 @@ def initialize_model_parallel(
     vae_parallel_size: int = 0,
     backend: Optional[str] = None,
 ) -> None:
-    if backend is None:
-        backend = envs.get_torch_distributed_backend()
     """
     Initialize model parallel groups.
 
     Arguments:
         data_parallel_degree: number of data parallelism groups.
         classifier_free_guidance_degree: number of GPUs used for Classifier Free Guidance (CFG)
-        sequence_parallel_degree: number of GPUs used for sequence parallelism. sequence_parallel_degree = ulysses_degree * ring_degree
+        sequence_parallel_degree: number of GPUs used for sequence parallelism.
         ulysses_degree: number of GPUs used for ulysses sequence parallelism.
         ring_degree: number of GPUs used for ring sequence parallelism.
         tensor_parallel_degree: number of GPUs used for tensor parallelism.
@@ -389,30 +361,11 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
-
-    if sequence_parallel_degree is None:
-        sequence_parallel_degree = ring_degree * ulysses_degree
-        logger.info(
-            f"sequence_parallel_degree is not provided, using ring_degree * ulysses_degree = {sequence_parallel_degree}"
-        )
-
-    if sequence_parallel_degree != ring_degree * ulysses_degree:
-        raise ValueError(
-            f"sequence_parallel_degree is not equal to ring_degree * ulysses_degree, {sequence_parallel_degree} != {ring_degree} * {ulysses_degree}"
-        )
-
-    # FIXME: Since the async p2p communication operation of NPU is not same as cuda in torch,
-    # the pipefusion is not ready for npu yet
-    if envs._is_npu():
-        assert pipeline_parallel_degree == 1, "Current pipefusion is not ready for NPU"
-
-    dit_parallel_size = (
-        data_parallel_degree
-        * classifier_free_guidance_degree
-        * sequence_parallel_degree
-        * pipeline_parallel_degree
-        * tensor_parallel_degree
-    )
+    dit_parallel_size = (data_parallel_degree *
+                     classifier_free_guidance_degree *
+                     sequence_parallel_degree *
+                     pipeline_parallel_degree *
+                     tensor_parallel_degree)
 
     if world_size < dit_parallel_size:
         raise RuntimeError(
@@ -450,6 +403,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="classifier_free_guidance",
     )
+
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     _PP = init_model_parallel_group(
@@ -471,7 +425,7 @@ def initialize_model_parallel(
             sp_ulysses_degree=ulysses_degree,
             sp_ring_degree=ring_degree,
             rank=get_world_group().rank_in_group,
-            world_size=dit_parallel_size,
+            world_size=dit_parallel_size
         )
 
         _SP = init_model_parallel_group(
@@ -502,7 +456,6 @@ def initialize_model_parallel(
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
-
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""

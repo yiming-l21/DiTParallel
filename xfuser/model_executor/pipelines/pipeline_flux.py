@@ -40,7 +40,6 @@ from xfuser.core.distributed import (
 from xfuser.core.distributed.group_coordinator import GroupCoordinator
 from .base_pipeline import xFuserPipelineBaseWrapper
 from .register import xFuserPipelineWrapperRegister
-from ...envs import _is_npu
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -76,14 +75,13 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         prompt = [""] * input_config.batch_size if input_config.batch_size > 1 else ""
         warmup_steps = get_runtime_state().runtime_config.warmup_steps
         get_runtime_state().runtime_config.warmup_steps = sync_steps
-        device = "npu" if _is_npu() else "cuda"
         self.__call__(
             height=input_config.height,
             width=input_config.width,
             prompt=prompt,
             num_inference_steps=steps,
             max_sequence_length=input_config.max_sequence_length,
-            generator=torch.Generator(device=device).manual_seed(42),
+            generator=torch.Generator(device="cuda").manual_seed(42),
             output_type=input_config.output_type,
         )
         get_runtime_state().runtime_config.warmup_steps = warmup_steps
@@ -116,7 +114,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         width: Optional[int] = None,
         num_inference_steps: int = 28,
         timesteps: List[int] = None,
-        guidance_scale: float = 3.5,
+        guidance_scale: float = 7.0,
         num_images_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
@@ -447,6 +445,10 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
     ):
         latents, latent_image_ids, prompt_embeds, text_ids = self._init_sync_pipeline(latents, latent_image_ids, prompt_embeds, text_ids)
         for i, t in enumerate(timesteps):
+            """COMPACT SET TIME STEP"""
+            from xfuser.compact.main import compact_set_step
+            compact_set_step(i)
+            
             if self.interrupt:
                 continue
             if is_pipeline_last_stage():
@@ -473,7 +475,13 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             #     guidance = guidance.expand(latents.shape[0])
             # else:
             #     guidance = None
-
+            """
+            Collector for Latents, Step Specific
+            """
+            from xfuser.collector.collector import collect
+            from xfuser.compact.main import compact_get_step
+            collect(latents, "latents", compact_get_step(), None)
+            
             latents, encoder_hidden_state = self._backbone_forward(
                 latents=latents,
                 encoder_hidden_states=(
@@ -640,13 +648,6 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                         latents = callback_outputs.pop("latents", latents)
                         prompt_embeds = callback_outputs.pop(
                             "prompt_embeds", prompt_embeds
-                        )
-                        negative_prompt_embeds = callback_outputs.pop(
-                            "negative_prompt_embeds", negative_prompt_embeds
-                        )
-                        negative_pooled_prompt_embeds = callback_outputs.pop(
-                            "negative_pooled_prompt_embeds",
-                            negative_pooled_prompt_embeds,
                         )
 
                     if i != len(timesteps) - 1:

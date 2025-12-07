@@ -4,23 +4,10 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from torch.cuda import manual_seed as device_manual_seed
-from torch.cuda import manual_seed_all as device_manual_seed_all
 import diffusers
 from diffusers import DiffusionPipeline
 import torch.distributed
 
-try:
-    import torch_musa
-    from torch_musa.core.random import manual_seed as device_manual_seed
-    from torch_musa.core.random import manual_seed_all as device_manual_seed_all
-except ModuleNotFoundError:
-    pass
-
-import xfuser.envs as envs
-if envs._is_npu():
-    from torch.npu import manual_seed as device_manual_seed
-    from torch.npu import manual_seed_all as device_manual_seed_all
 from xfuser.config.config import (
     ParallelConfig,
     RuntimeConfig,
@@ -46,8 +33,8 @@ def set_random_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    device_manual_seed(seed)
-    device_manual_seed_all(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 class RuntimeState(metaclass=ABCMeta):
@@ -88,21 +75,10 @@ class RuntimeState(metaclass=ABCMeta):
                 vae_parallel_size=parallel_config.vae_parallel_size,
             )
 
-    def destroy_distributed_env(self):
+    def destory_distributed_env(self):
         if model_parallel_is_initialized():
             destroy_model_parallel()
         destroy_distributed_environment()
-
-
-class UnetRuntimeState(RuntimeState):
-    def __init__(self, pipeline: DiffusionPipeline, config: EngineConfig):
-        super().__init__(config)
-        self.sanity_check()
-    
-    def sanity_check(self):
-        if self.parallel_config.world_size > 1:
-            if not(self.parallel_config.cfg_degree == 2 and self.parallel_config.world_size == 2):
-                raise RuntimeError("UnetRuntimeState only supports 2 GPUs with CFG Parallel")
 
 
 class DiTRuntimeState(RuntimeState):
@@ -131,7 +107,7 @@ class DiTRuntimeState(RuntimeState):
         self.cogvideox = False
         self.consisid = False
         self.hunyuan_video = False
-        if pipeline.__class__.__name__.startswith(("CogVideoX", "ConsisID", "HunyuanVideo", "Wan")):
+        if pipeline.__class__.__name__.startswith(("CogVideoX", "ConsisID", "HunyuanVideo")):
             if pipeline.__class__.__name__.startswith("CogVideoX"):
                 self.cogvideox = True
             elif pipeline.__class__.__name__.startswith("ConsisID"):
@@ -678,6 +654,3 @@ def initialize_runtime_state(pipeline: DiffusionPipeline, engine_config: EngineC
         )
     if hasattr(pipeline, "transformer"):
         _RUNTIME = DiTRuntimeState(pipeline=pipeline, config=engine_config)
-    elif hasattr(pipeline, "unet"):
-        _RUNTIME = UnetRuntimeState(pipeline=pipeline, config=engine_config)
-

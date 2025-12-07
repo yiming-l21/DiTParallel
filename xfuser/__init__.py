@@ -7,9 +7,6 @@ from xfuser.model_executor.pipelines import (
     xFuserHunyuanDiTPipeline,
     xFuserCogVideoXPipeline,
     xFuserConsisIDPipeline,
-    xFuserStableDiffusionXLPipeline,
-    xFuserSanaPipeline,
-    xFuserSanaSprintPipeline,
 )
 from xfuser.config import xFuserArgs, EngineConfig
 from xfuser.parallel import xDiTParallel
@@ -23,9 +20,6 @@ __all__ = [
     "xFuserHunyuanDiTPipeline",
     "xFuserCogVideoXPipeline",
     "xFuserConsisIDPipeline",
-    "xFuserStableDiffusionXLPipeline",
-    "xFuserSanaPipeline",
-    "xFuserSanaSprintPipeline",
     "xFuserArgs",
     "EngineConfig",
     "xDiTParallel",

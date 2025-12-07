@@ -261,9 +261,9 @@ class InputConfig:
     negative_prompt: Union[str, List[str]] = ""
     num_inference_steps: int = 20
     max_sequence_length: int = 256
+    guidance_scale: float = 6
     seed: int = 42
     output_type: str = "pil"
-    guidance_scale: float = 3.5
 
     def __post_init__(self):
         if isinstance(self.prompt, list):

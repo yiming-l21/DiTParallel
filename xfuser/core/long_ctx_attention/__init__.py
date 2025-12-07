@@ -1,10 +1,5 @@
-from .hybrid import (
-    xFuserLongContextAttention, 
-    xFuserSanaLinearLongContextAttention,
-    AttnType,)
+from .hybrid import xFuserLongContextAttention
 
 __all__ = [
     "xFuserLongContextAttention",
-    "xFuserSanaLinearLongContextAttention",
-    "AttnType",
 ]

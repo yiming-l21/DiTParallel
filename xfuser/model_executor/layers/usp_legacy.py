@@ -4,14 +4,9 @@ from torch.nn import functional as F
 
 import torch.distributed._functional_collectives as ft_c
 
-if torch.cuda.is_available():
-    from yunchang.globals import PROCESS_GROUP
-    from yunchang.ring.ring_flash_attn import ring_flash_attn_forward
-    from yunchang.ring.ring_pytorch_attn import ring_pytorch_attn_func
-else:
-    PROCESS_GROUP = None
-    ring_flash_attn_forward = None
-    ring_pytorch_attn_func = None
+from yunchang.globals import PROCESS_GROUP
+from yunchang.ring.ring_flash_attn import ring_flash_attn_forward
+from yunchang.ring.ring_pytorch_attn import ring_pytorch_attn_func
 
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,

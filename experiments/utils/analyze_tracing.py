@@ -3,10 +3,16 @@
 """
 分析 PyTorch profiler 导出的 Chrome trace JSON：
 - 只看某个 GPU device 的 kernel 事件
-- 利用 args["Collective name"] 区分通信和计算 kernel
+- 利用 args["Collective name"] 或 kernel 名字里的 nccl/allreduce/sendrecv 等关键字
+  区分通信和计算 kernel
 - 支持按 ProfilerStep#N 裁剪时间窗口
 - 计算通信/计算时间 & overlap ratio
 - 估计通信量（按 In/Out msg nelems 和 dtype 估计本 GPU 上的 payload 字节数）
+
+注意：
+- 现在大部分 NCCL kernel 的 args 里没有 "Collective name"/"In msg nelems"/"dtype"，
+  这些信息通常存在于 CPU 侧的 record_param_comms 事件里，通过 correlation id 关联。
+- 本脚本会先在所有事件中构建 correlation -> 通信元数据 的映射，再用它来估计通信量。
 """
 
 import argparse
@@ -42,6 +48,8 @@ def get_step_window(events: List[Dict[str, Any]],
         if ev.get("ph") != "X":
             continue
         if ev.get("name") != target_name:
+            continue
+        if not ev.get("cat", "").startswith("gpu"):
             continue
         ts = float(ev.get("ts", 0.0))
         dur = float(ev.get("dur", 0.0))
@@ -107,19 +115,49 @@ def get_gpu_kernel_events(events: List[Dict[str, Any]],
 def split_comm_compute(events: List[Dict[str, Any]]
                        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    用是否存在 "Collective name" 字段来区分 通信 / 计算 kernel
+    区分 通信 / 计算 kernel：
+
+    规则：
+    1) 如果 args 里有 "Collective name"，一定视为通信；
+    2) 否则，如果 kernel 名字里包含以下关键字之一，也视为通信：
+         nccl, allreduce, all_reduce, allgather, all_gather,
+         reduce_scatter, reducescatter, broadcast, sendrecv, send_recv
     """
+    COMM_KEYWORDS = (
+        "nccl",
+        "allreduce", "all_reduce",
+        "allgather", "all_gather",
+        "reduce_scatter", "reducescatter",
+        "broadcast",
+        "sendrecv", "send_recv",
+    )
+
     comm: List[Dict[str, Any]] = []
     comp: List[Dict[str, Any]] = []
+
     for e in events:
-        if "Collective name" in e.get("args", {}):
+        args = e.get("args", {})
+        name = e.get("name", "").lower()
+
+        is_comm = False
+
+        # 情况 1：有 Collective name（某些版本 / 设置下可能存在）
+        if "Collective name" in args:
+            is_comm = True
+        else:
+            # 情况 2：靠 kernel 名字匹配 NCCL / collectives
+            if any(kw in name for kw in COMM_KEYWORDS):
+                is_comm = True
+
+        if is_comm:
             comm.append(e)
         else:
             comp.append(e)
+
     return comm, comp
 
 
-# ---------- 通信量估计 ----------
+# ---------- 通信量估计相关工具 ----------
 
 DTYPE_BYTES: Dict[str, int] = {
     # int / uint / bool
@@ -152,18 +190,76 @@ def _to_int_or_none(v: Any) -> int:
     return None
 
 
-def estimate_comm_volume(comm_events: List[Dict[str, Any]]
+def build_comm_meta(events: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    """
+    在所有事件中构建 correlation -> 通信元数据 的映射。
+
+    典型用法：
+    - CPU 事件（如 record_param_comms）里带有：
+        "Collective name", "In msg nelems", "Out msg nelems", "dtype", "correlation"
+    - GPU kernel 事件（ncclDevKernel_*）里有 "correlation"，但没有上述字段。
+
+    我们：
+    - 遍历所有事件，找出那些带 msg 大小 / dtype / Collective name 的事件；
+    - 用 args["correlation"] / "External id" / "Correlation ID" 作为 key；
+    - 把这些 args 合并存到 meta 字典里。
+    """
+    meta: Dict[int, Dict[str, Any]] = {}
+
+    for ev in events:
+        if ev.get("ph") != "X":
+            continue
+        args = ev.get("args", {})
+        # 尝试从多种字段里拿 correlation，这里统一成 int
+        corr = _to_int_or_none(
+            args.get("correlation")
+            or args.get("Correlation ID")
+            or args.get("CorrelationId")
+            or args.get("External id")
+            or args.get("external_id")
+        )
+        if corr is None:
+            continue
+
+        has_nelems = ("In msg nelems" in args) or ("Out msg nelems" in args)
+        has_dtype = ("dtype" in args) or ("data_type" in args) or ("DType" in args)
+        has_coll = ("Collective name" in args)
+
+        if not (has_nelems or has_dtype or has_coll):
+            # 这个事件没有我们关心的通信元数据，跳过
+            continue
+
+        if corr not in meta:
+            meta[corr] = dict(args)
+        else:
+            # 简单 merge：只补充缺失字段
+            for k, v in args.items():
+                if k not in meta[corr]:
+                    meta[corr][k] = v
+
+    return meta
+
+
+def estimate_comm_volume(comm_events: List[Dict[str, Any]],
+                         corr_meta: Dict[int, Dict[str, Any]]
                          ) -> Tuple[int, Dict[str, int]]:
     """
     估计通信量（本 GPU 的 payload 字节数）
 
-    对每个通信 kernel：
-      nelems = max(In msg nelems, Out msg nelems)
-      bytes  = nelems * dtype_size
+    逻辑：
+    - 对每个通信 kernel（GPU 事件）：
+        1) 先查它自己的 args 里是否有 "In msg nelems"/"Out msg nelems"/"dtype"；
+        2) 如果没有，则用 args["correlation"]/External id 到 corr_meta 里查对应的 CPU 侧元数据；
+        3) 将两份 args 合并后，再用：
+             nelems = max(In msg nelems, Out msg nelems)
+             bytes  = nelems * dtype_size
 
     返回：
       total_bytes: 所有通信 kernel 累积字节数
-      per_coll:    按 Collective name 聚合的字节数
+      per_coll:    按 Collective name 聚合的字节数（没有则归类为 "unknown"）
+
+    注意：
+    - 如果既没有 msg nelems 也没有 dtype，则该 kernel 无法估计，直接跳过。
     """
     from collections import defaultdict
 
@@ -171,25 +267,47 @@ def estimate_comm_volume(comm_events: List[Dict[str, Any]]
     per_coll: Dict[str, int] = defaultdict(int)
 
     for e in comm_events:
-        args = e.get("args", {})
-        coll = args.get("Collective name", "unknown")
+        args = e.get("args", {}) or {}
 
-        ne_in = _to_int_or_none(args.get("In msg nelems"))
-        ne_out = _to_int_or_none(args.get("Out msg nelems"))
+        # 先从 GPU 事件 args 里拿 correlation
+        corr = _to_int_or_none(
+            args.get("correlation")
+            or args.get("Correlation ID")
+            or args.get("CorrelationId")
+            or args.get("External id")
+            or args.get("external_id")
+        )
+
+        # 基础元数据：先用 CPU 侧的，再用 GPU 侧覆盖
+        merged_args: Dict[str, Any] = {}
+        if corr is not None and corr in corr_meta:
+            merged_args.update(corr_meta[corr])
+        merged_args.update(args)
+
+        coll = merged_args.get("Collective name", "unknown")
+
+        ne_in = _to_int_or_none(merged_args.get("In msg nelems"))
+        ne_out = _to_int_or_none(merged_args.get("Out msg nelems"))
 
         if ne_in is None and ne_out is None:
+            # 没有 msg 大小信息，跳过这个 kernel
             continue
 
         nelems = max(ne_in or 0, ne_out or 0)
         if nelems <= 0:
             continue
 
-        dtype = args.get("dtype")
+        # dtype 可能存在多种 key 下
+        dtype = (
+            merged_args.get("dtype")
+            or merged_args.get("data_type")
+            or merged_args.get("DType")
+        )
         if dtype is None:
-            # 某些 trace 可能没有 dtype，没法估算字节
+            # 没 dtype，无法估算字节数，跳过
             continue
 
-        bpe = DTYPE_BYTES.get(dtype, None)
+        bpe = DTYPE_BYTES.get(str(dtype), None)
         if bpe is None:
             # 未知类型，跳过
             continue
@@ -305,6 +423,9 @@ def main():
                   f"[{t0:.0f}, {t1:.0f}] (duration={step_dur_us/1000.0:.3f} ms)")
             events = filter_by_window(events, t0, t1)
 
+    # 构建 correlation -> 通信元数据 映射（基于当前时间窗口内的所有事件）
+    corr_meta = build_comm_meta(events)
+
     # 只保留指定 device 的 GPU kernel
     gpu_events = get_gpu_kernel_events(events, device=args.device)
     if not gpu_events:
@@ -342,7 +463,7 @@ def main():
     overlap_ratio_total = (ovlp_time_us / total_active_us) if total_active_us > 0 else 0.0
 
     # 通信量估计
-    total_bytes, per_coll = estimate_comm_volume(comm_events)
+    total_bytes, per_coll = estimate_comm_volume(comm_events, corr_meta)
     total_gb = total_bytes / (1024.0 ** 3) if total_bytes > 0 else 0.0
 
     print("\n========== Summary ==========")

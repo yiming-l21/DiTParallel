@@ -1,9 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 set -x
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 # 把当前仓库加入 PYTHONPATH
 export PYTHONPATH="$PWD:$PYTHONPATH"
+
+######################
+#  小工具函数        #
+######################
+
+# 统计一个目录中已有的图片数量（支持 png/jpg/jpeg）
+count_images() {
+    local dir="$1"
+    if [[ ! -d "$dir" ]]; then
+        echo 0
+        return
+    fi
+    find "$dir" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) | wc -l
+}
 
 ######################
 #  模型类型选择区域  #
@@ -15,7 +29,7 @@ declare -A MODEL_CONFIGS=(
     ["Pixart-alpha"]="pixartalpha_example.py /cfs/dit/PixArt-XL-2-1024-MS 20"
     ["Pixart-sigma"]="pixartsigma_example.py /cfs/dit/PixArt-Sigma-XL-2-2K-MS 20"
     ["Sd3"]="sd3_example.py /cfs/dit/stable-diffusion-3-medium-diffusers 20"
-    ["Flux"]="flux_example.py ./cfs/dit/FLUX.1-dev 28"
+    ["Flux"]="flux_example.py /export/home/liuyiming54/flux-dev 28"
     ["FluxControl"]="flux_control_example.py /cfs/dit/FLUX.1-Depth-dev 28"
     ["HunyuanDiT"]="hunyuandit_example.py /cfs/dit/HunyuanDiT-v1.2-Diffusers 50"
     ["SDXL"]="sdxl_example.py /cfs/dit/stable-diffusion-xl-base-1.0 30"
@@ -39,6 +53,10 @@ TASK_ARGS="--height 2048 --width 2048 --no_use_resolution_binning --guidance_sca
 # prompt 列表文件
 PROMPTS_FILE="./experiments/data/prompts.txt"
 
+# 总 prompt 数（忽略空行）  ==== 断点续跑相关 ====
+TOTAL_PROMPTS=$(awk 'NF>0{c++} END{print c+0}' "${PROMPTS_FILE}")
+echo "[INFO] TOTAL_PROMPTS=${TOTAL_PROMPTS}"
+
 # 只 profile 第 PROF_STEP 个 denoising step（0-based）
 PROF_STEP=10
 
@@ -49,43 +67,40 @@ PROF_STEP=10
 # 单卡 baseline：results/base/imgs
 BASE_RESULT_ROOT="./results/base"
 BASE_IMG_DIR="${BASE_RESULT_ROOT}/imgs"
+mkdir -p "${BASE_RESULT_ROOT}"
 
-if [[ ! -d "${BASE_IMG_DIR}" ]] || [[ -z "$(ls -A "${BASE_IMG_DIR}" 2>/dev/null)" ]]; then
-    echo "[INFO] Baseline images not found, running 1-GPU baseline to ${BASE_IMG_DIR} ..."
-    mkdir -p "${BASE_RESULT_ROOT}"
+# 统计 baseline 目录已有图片数  ==== 断点续跑相关 ====
+EXISTING_BASE_IMAGES=$(count_images "${BASE_IMG_DIR}")
+echo "[INFO] Baseline existing images: ${EXISTING_BASE_IMAGES}"
 
-    base_run_id=0
-    while IFS= read -r B_PROMPT || [[ -n "${B_PROMPT}" ]]; do
-        # 跳过空行
-        if [[ -z "${B_PROMPT}" ]]; then
-            continue
-        fi
-        # 跳过注释
-        if [[ "${B_PROMPT}" =~ ^# ]]; then
-            continue
-        fi
-
-        echo "=============================="
-        echo " BASE RUN ${base_run_id}, prompt: ${B_PROMPT}"
-        echo "=============================="
-
-        # run_id 用 4 位零填充，保证排序一致：0000, 0001, ...
-        BASE_RUN_ID_STR=$(printf "%04d" "${base_run_id}")
-        export RUN_ID="${BASE_RUN_ID_STR}"
-        export RESULT_ROOT="${BASE_RESULT_ROOT}"
-
-        # 单卡不需要并行参数，也不需要 profiler（只要图片）
-        torchrun --nproc_per_node=1 "./experiments/${SCRIPT}" \
-            --model "${MODEL_ID}" \
-            ${TASK_ARGS} \
-            --num_inference_steps "${INFERENCE_STEP}" \
-            --warmup_steps 1 \
-            --prompt "${B_PROMPT}"
-
-        base_run_id=$((base_run_id + 1))
-    done < "${PROMPTS_FILE}"
+if (( EXISTING_BASE_IMAGES >= TOTAL_PROMPTS )); then
+    echo "[INFO] Baseline images already complete (${EXISTING_BASE_IMAGES}/${TOTAL_PROMPTS}), skip baseline generation."
 else
-    echo "[INFO] Baseline images already exist under ${BASE_IMG_DIR}, skip baseline generation."
+    if (( EXISTING_BASE_IMAGES > 0 )); then
+        echo "[INFO] Resume baseline: found ${EXISTING_BASE_IMAGES} images, continue from prompt index $((EXISTING_BASE_IMAGES+1))."
+    else
+        echo "[INFO] Baseline images not found, start from scratch."
+    fi
+
+    mkdir -p "${BASE_IMG_DIR}"
+
+    # 生成一个临时 prompts 文件，只包含「尚未生成」的 prompts  ==== 断点续跑相关 ====
+    TMP_BASE_PROMPTS_FILE=$(mktemp)
+    # tail -n +K 表示从第 K 行开始，这里是从已有图片数 + 1 行开始
+    tail -n +"$((EXISTING_BASE_IMAGES + 1))" "${PROMPTS_FILE}" > "${TMP_BASE_PROMPTS_FILE}"
+
+    export RESULT_ROOT="${BASE_RESULT_ROOT}"
+    # 让内部脚本从 EXISTING_BASE_IMAGES 这个 run_id 开始编号  ==== 断点续跑相关 ====
+    export RUN_ID="${EXISTING_BASE_IMAGES}"
+
+    python -m torch.distributed.run --nproc_per_node=1 "./experiments/${SCRIPT}" \
+        --model "${MODEL_ID}" \
+        ${TASK_ARGS} \
+        --num_inference_steps "${INFERENCE_STEP}" \
+        --warmup_steps 1 \
+        --prompts_file "${TMP_BASE_PROMPTS_FILE}"
+
+    rm -f "${TMP_BASE_PROMPTS_FILE}"
 fi
 
 ######################
@@ -95,100 +110,111 @@ fi
 # 使用的 GPU 数
 N_GPUS=2
 
-# 并行配置（这里是 Ulysses = 2 卡场景）
-PARALLEL_ARGS="--pipefusion_parallel_degree 2 --ulysses_degree 1 --ring_degree 1 --num_pipeline_patch 2"
-
+# 并行配置
+PARALLEL_ARGS="--pipefusion_parallel_degree 2 --ulysses_degree 1 --ring_degree 1"
 # 方法名（用于结果目录分类；你可以换成 sp / dp / ring 等）
-METHOD="pp"
+METHOD="pipefusion"
 
 # 根结果目录：results/<method>/<ngpus>
 RESULT_ROOT="./results/${METHOD}/${N_GPUS}"
 mkdir -p "${RESULT_ROOT}"
 
 ######################
-#       主循环       #
+#       运行并行      #
 ######################
 
-run_id=0
+# 本次实验的 trace 目录：results/<method>/<ngpus>/traces
+TRACE_DIR="${RESULT_ROOT}/traces"
+mkdir -p "${TRACE_DIR}"
 
-while IFS= read -r PROMPT || [[ -n "${PROMPT}" ]]; do
-    # 跳过空行
-    if [[ -z "${PROMPT}" ]]; then
-        continue
+# 并行方法的 imgs 目录（由 Python 脚本创建）  ==== 断点续跑相关 ====
+METHOD_IMG_DIR="${RESULT_ROOT}/imgs"
+
+# 统计并行方法已有的图片数  ==== 断点续跑相关 ====
+EXISTING_METHOD_IMAGES=$(count_images "${METHOD_IMG_DIR}")
+echo "[INFO] Method(${METHOD}) existing images: ${EXISTING_METHOD_IMAGES}"
+
+if (( EXISTING_METHOD_IMAGES >= TOTAL_PROMPTS )); then
+    echo "[INFO] Method ${METHOD} images already complete (${EXISTING_METHOD_IMAGES}/${TOTAL_PROMPTS}), skip parallel run."
+else
+    if (( EXISTING_METHOD_IMAGES > 0 )); then
+        echo "[INFO] Resume method ${METHOD}: found ${EXISTING_METHOD_IMAGES} images, continue from prompt index $((EXISTING_METHOD_IMAGES+1))."
+    else
+        echo "[INFO] No method ${METHOD} images found, start from scratch."
     fi
-    # 跳过注释行（以 # 开头）
-    if [[ "${PROMPT}" =~ ^# ]]; then
-        continue
-    fi
 
-    echo "=============================="
-    echo " RUN ${run_id}, prompt: ${PROMPT}"
-    echo "=============================="
+    # 生成一个临时 prompts 文件，只包含尚未生成的 prompts  ==== 断点续跑相关 ====
+    TMP_METHOD_PROMPTS_FILE=$(mktemp)
+    tail -n +"$((EXISTING_METHOD_IMAGES + 1))" "${PROMPTS_FILE}" > "${TMP_METHOD_PROMPTS_FILE}"
 
-    # run_id 用 4 位零填充：0000, 0001, ...
-    RUN_ID_STR=$(printf "%04d" "${run_id}")
-    export RUN_ID="${RUN_ID_STR}"
+    # 这一次就不在外层循环 prompt 了，所有 prompt 交给脚本内部处理
     export RESULT_ROOT="${RESULT_ROOT}"
+    # 并行实验内部的 run_id 起始 offset，从已有图片数继续  ==== 断点续跑相关 ====
+    export RUN_ID="${EXISTING_METHOD_IMAGES}"
 
-    # 本次实验的 trace 目录：results/<method>/<ngpus>/traces
-    TRACE_DIR="${RESULT_ROOT}/traces"
-    mkdir -p "${TRACE_DIR}"
-
-    ##################################################################
-    # 1) 运行模型推理 + torch.profiler（每个 rank 会输出一个 trace_*.json）
-    ##################################################################
-    torchrun --nproc_per_node="${N_GPUS}" "./experiments/${SCRIPT}" \
+    python -m torch.distributed.run --nproc_per_node="${N_GPUS}" --master_port $(( 12345 + RANDOM % 20000 )) \
+        "./experiments/${SCRIPT}" \
         --model "${MODEL_ID}" \
         ${PARALLEL_ARGS} \
         ${TASK_ARGS} \
         --num_inference_steps "${INFERENCE_STEP}" \
         --warmup_steps 1 \
-        --prompt "${PROMPT}" \
+        --prompts_file "${TMP_METHOD_PROMPTS_FILE}" \
         --torch_profiler \
         --torch_profiler_step "${PROF_STEP}" \
-        --torch_profiler_dir "${TRACE_DIR}"
+        --torch_profiler_dir "${TRACE_DIR}" \
+        --method_tag ${METHOD}
 
-    ##################################################################
-    # 2) 用 analyze_tracing.py 解析当前 run 的 rank0 trace，生成 comm_xxx_0.txt
-    #    trace 文件名形如：
-    #    trace_dp1_cfg1_ulysses2_ring1_tp1_pp1_patchNone_run0000_rank0_of2.json
-    ##################################################################
-    TRACE_PATTERN="${TRACE_DIR}/trace_dp*_run${RUN_ID_STR}_rank0_of${N_GPUS}.json"
-    # 这里用 ls 让 * 展开成真实文件名，再取第一个
-    TRACE_FILE=$(ls ${TRACE_PATTERN} 2>/dev/null | head -n 1 || true)
+    rm -f "${TMP_METHOD_PROMPTS_FILE}"
+fi
 
-    if [[ -n "${TRACE_FILE}" && -f "${TRACE_FILE}" ]]; then
-        base=$(basename "${TRACE_FILE}")          # trace_xxx.json
-        base_noext=${base%.json}                 # trace_xxx
-        tmp=${base_noext#trace_}                 # 去掉前缀 trace_
-        # dp1_cfg1_ulysses2_ring1_tp1_pp1_patchNone_run0000_rank0_of2
-        # 截到 _rank0 之前，得到：
-        # dp1_cfg1_ulysses2_ring1_tp1_pp1_patchNone_run0000
+######################
+#   2) 解析所有 trace #
+######################
+
+COMM_DIR="${RESULT_ROOT}/comm"
+mkdir -p "${COMM_DIR}"
+
+TRACE_PATTERN="${TRACE_DIR}/trace_dp*_run*_rank0_of${N_GPUS}.json"
+
+shopt -s nullglob
+TRACE_FILES=(${TRACE_PATTERN})
+
+if (( ${#TRACE_FILES[@]} == 0 )); then
+    echo "[WARN] No trace files found in ${TRACE_DIR} for pattern=${TRACE_PATTERN}"
+else
+    for TRACE_FILE in "${TRACE_FILES[@]}"; do
+        base=$(basename "${TRACE_FILE}")      # trace_xxx.json
+        base_noext=${base%.json}             # trace_xxx
+        tmp=${base_noext#trace_}             # 去掉前缀 trace_
+
+        # 例如：
+        #   tmp = dp1_cfg1_ulysses2_ring1_tp1_pp1_patchNone_run0003_rank0_of2
+        #   method_tag = dp1_cfg1_ulysses2_ring1_tp1_pp1_patchNone_run0003
         method_tag=${tmp%_rank0*}
 
-        COMM_DIR="${RESULT_ROOT}/comm"
-        mkdir -p "${COMM_DIR}"
+        # 从 method_tag 里把 run 索引抠出来：
+        #   method_tag=..._run0003  => run_str=0003 => img_idx=3
+        run_str=${method_tag##*_run}
+        img_idx=$((10#${run_str}))
 
-        img_idx=0
         COMM_FILE="${COMM_DIR}/comm_${method_tag}_${img_idx}.txt"
+
+        echo "[INFO] analyze trace: ${TRACE_FILE} -> ${COMM_FILE}"
 
         python "./experiments/utils/analyze_tracing.py" \
             "${TRACE_FILE}" \
             --device 0 \
             --step "${PROF_STEP}" \
             > "${COMM_FILE}"
-    else
-        echo "[WARN] Trace file not found for run_id=${run_id}: pattern=${TRACE_PATTERN}"
-    fi
-
-    run_id=$((run_id + 1))
-done < "${PROMPTS_FILE}"
+    done
+fi
+shopt -u nullglob
 
 ######################
 #   3) 计算质量指标   #
 ######################
 
-METHOD_IMG_DIR="${RESULT_ROOT}/imgs"
 METRIC_OUT="${RESULT_ROOT}/metrics.txt"
 
 if [[ -d "${BASE_IMG_DIR}" ]] && [[ -n "$(ls -A "${BASE_IMG_DIR}" 2>/dev/null)" ]]; then

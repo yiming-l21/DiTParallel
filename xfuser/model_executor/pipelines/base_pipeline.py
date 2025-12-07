@@ -34,10 +34,6 @@ from xfuser.core.distributed import (
     get_vae_parallel_group,
     get_dit_group,
 )
-from xfuser.envs import (
-    get_device,
-    get_device_name,
-)
 from xfuser.core.fast_attention import (
     get_fast_attn_enable,
     initialize_fast_attn_state,
@@ -109,7 +105,7 @@ class xFuserVAEWrapper:
     
     def execute(self, output_type:str):
         if self.vae is not None:
-            device = get_device(get_world_group().local_rank)
+            device = f"cuda:{get_world_group().local_rank}"
             rank = get_world_group().rank
             dit_parallel_size = self.dit_parallel_size
             dtype = self.dtype
@@ -331,7 +327,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
             prompt=prompt,
             use_resolution_binning=input_config.use_resolution_binning,
             num_inference_steps=steps,
-            generator=torch.Generator(device=get_device_name()).manual_seed(42),
+            generator=torch.Generator(device="cuda").manual_seed(42),
             output_type=input_config.output_type,
         )
         get_runtime_state().runtime_config.warmup_steps = warmup_steps
@@ -349,7 +345,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
             # use_resolution_binning=input_config.use_resolution_binning,
             num_inference_steps=steps,
             output_type="latent",
-            generator=torch.Generator(device=get_device_name()).manual_seed(42),
+            generator=torch.Generator(device="cuda").manual_seed(42),
         )
         get_runtime_state().runtime_config.warmup_steps = warmup_steps
 
@@ -366,12 +362,14 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
     def _convert_transformer_backbone(
         self, transformer: nn.Module, enable_torch_compile: bool, enable_onediff: bool, cache_args: Optional[Dict] = None,
     ):
+        from diffusers.models.transformers.cogvideox_transformer_3d import CogVideoXTransformer3DModel
         if (
             get_pipeline_parallel_world_size() == 1
             and get_sequence_parallel_world_size() == 1
             and get_classifier_free_guidance_world_size() == 1
             and get_tensor_model_parallel_world_size() == 1
             and get_fast_attn_enable() == False
+            and not isinstance(transformer, CogVideoXTransformer3DModel)
         ):
             logger.info(
                 "Transformer backbone found, but model parallelism is not enabled, "
@@ -443,26 +441,18 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
     def _convert_unet_backbone(
         self,
         unet: nn.Module,
-        enable_torch_compile: bool = False, 
-        enable_onediff: bool = False,
     ):
-        # TODO() add support for torch.compile and onediff
-        return unet
+        logger.info("UNet Backbone found")
+        raise NotImplementedError("UNet parallelisation is not supported yet")
 
     def _convert_scheduler(
         self,
         scheduler: nn.Module,
     ):
-        logger.info("Scheduler found, trying to parallel scheduler...")
+        logger.info("Scheduler found, paralleling scheduler...")
         wrapper = xFuserSchedulerWrappersRegister.get_wrapper(scheduler)
-
-        if wrapper is None:
-            logger.warning(f"Scheduler class {scheduler.__class__.__name__} "
-                         f"is not supported by xFuser, may not applied for PipeFusion Parallel")
-            return scheduler
-        else:
-            scheduler = wrapper(scheduler)
-            return scheduler
+        scheduler = wrapper(scheduler)
+        return scheduler
 
     def _convert_vae(
         self,
@@ -577,7 +567,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
             return latents
 
         rank = get_world_group().rank
-        device = get_device(get_world_group().local_rank)
+        device = f"cuda:{get_world_group().local_rank}"
         dit_parallel_size = get_dit_world_size()
 
         # Gather only from DP last groups to the first VAE worker
@@ -613,7 +603,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
         
         # ---------gather latents from dp last group-----------
         rank = get_world_group().rank
-        device = get_device(get_world_group().local_rank)
+        device = f"cuda:{get_world_group().local_rank}"
 
         # all gather dp last group rank list
         dp_rank_list = [torch.zeros(1, dtype=int, device=device) for _ in range(get_world_group().world_size)]

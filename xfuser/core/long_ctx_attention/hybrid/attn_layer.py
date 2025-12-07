@@ -1,33 +1,21 @@
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 import torch.distributed
+from yunchang import LongContextAttention
+try:
+    from yunchang.kernels import AttnType
+except ImportError:
+    raise ImportError("Please install yunchang 0.6.0 or later")
 
-if torch.cuda.is_available():
-    from yunchang import LongContextAttention
-    try:
-        from yunchang.kernels import AttnType
-    except ImportError:
-        raise ImportError("Please install yunchang 0.6.0 or later")
-
-    from yunchang.comm.all_to_all import SeqAllToAll4D
-    from yunchang.globals import HAS_SPARSE_SAGE_ATTENTION
-else:
-    LongContextAttention = object
-    AttnType = None
-    HAS_SPARSE_SAGE_ATTENTION = False
-
+from yunchang.comm.all_to_all import SeqAllToAll4D
 
 from xfuser.logger import init_logger
 
-from xfuser.core.distributed import (
-    get_ring_parallel_world_size,
-    )
 
 logger = init_logger(__name__)
 
-
+ATTN_LAYER_IDX = 0 # COMPACT
 class xFuserLongContextAttention(LongContextAttention):
     ring_impl_type_supported_kv_cache = ["basic"]
 
@@ -38,12 +26,7 @@ class xFuserLongContextAttention(LongContextAttention):
         ring_impl_type: str = "basic",
         use_pack_qkv: bool = False,
         use_kv_cache: bool = False,
-        use_sync: bool = False,
-        attn_type: AttnType = None,
-        attn_processor: torch.nn.Module = None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
+        attn_type: AttnType = AttnType.FA,
     ) -> None:
         """
         Arguments:
@@ -52,27 +35,15 @@ class xFuserLongContextAttention(LongContextAttention):
             ring_impl_type: str = "basic", the ring implementation type, currently only support "basic"
             use_pack_qkv: bool = False, whether to use pack qkv in the input
             use_kv_cache: bool = False, whether to use kv cache in the attention layer, which is applied in PipeFusion.
-            attn_type: AttnType = AttnType.FA, the attention type supported inside long context attention, including "TORCH", "FA", "FA3", "SAGE_FP16", "SAGE_FP8"
-            attn_processor: nn.Module = None, the attention processor can be passed in to replace the attention processor if attn_type is do not support it.
         """
-
-        # A workaround to allow running xDiT without having yunchang installed
-        # while still supporting AttnType.FA as the default value for legacy reasons
-        if attn_type is None:
-            attn_type = AttnType.FA
-
         super().__init__(
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             ring_impl_type=ring_impl_type,
             use_pack_qkv=use_pack_qkv,
-            use_sync=use_sync,
             attn_type = attn_type,
         )
         self.use_kv_cache = use_kv_cache
-        self.q_descale = q_descale
-        self.k_descale = k_descale
-        self.v_descale = v_descale
         if (
             use_kv_cache
             and ring_impl_type not in self.ring_impl_type_supported_kv_cache
@@ -80,15 +51,18 @@ class xFuserLongContextAttention(LongContextAttention):
             raise RuntimeError(
                 f"ring_impl_type: {ring_impl_type} do not support SP kv cache."
             )
-
-        if HAS_SPARSE_SAGE_ATTENTION:
-            from spas_sage_attn.autotune import SparseAttentionMeansim
-            if isinstance(attn_processor, SparseAttentionMeansim) and torch.distributed.get_world_size(self.ring_pg) > 1:
-                raise RuntimeError("Sparse Sage attention does not support ring degree > 1.")
-
-        self.attn_processor = attn_processor
+        
         from xfuser.core.long_ctx_attention.ring import xdit_ring_flash_attn_func
-        self.ring_attn_fn = xdit_ring_flash_attn_func
+        """
+        COMPACT ATTN
+        """
+        from xfuser.compact.main import compact_config
+        from xfuser.compact.ring import compact_fwd
+        if compact_config().enabled:
+            self.ring_attn_fn = compact_fwd
+        else:
+            self.ring_attn_fn = xdit_ring_flash_attn_func
+        self.idx = None # NOTE: assign idx in forward
 
     @torch.compiler.disable
     def forward(
@@ -171,52 +145,88 @@ class xFuserLongContextAttention(LongContextAttention):
                 * (ulysses_rank + 1),
                 :,
             ]
-
+        from xfuser.prof import Profiler
         # 3 X (bs, seq_len/N, head_cnt, head_size) -> 3 X (bs, seq_len, head_cnt/N, head_size)
         # scatter 2, gather 1
-        if self.use_pack_qkv:
-            # (3*bs, seq_len/N, head_cnt, head_size)
-            qkv = torch.cat([query, key, value]).contiguous()
-            # (3*bs, seq_len, head_cnt/N, head_size)
-            qkv = SeqAllToAll4D.apply(
-                self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx
-            )
-            qkv = torch.chunk(qkv, 3, dim=0)
-            query_layer, key_layer, value_layer = qkv
+        with Profiler.instance().scope("ulysses.all2all"):
+            if self.use_pack_qkv:
+                # (3*bs, seq_len/N, head_cnt, head_size)
+                qkv = torch.cat([query, key, value]).continous()
+                # (3*bs, seq_len, head_cnt/N, head_size)
+                qkv = SeqAllToAll4D.apply(
+                    self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx
+                )
+                qkv = torch.chunk(qkv, 3, dim=0)
+                query_layer, key_layer, value_layer = qkv
 
+            else:
+                query_layer = SeqAllToAll4D.apply(
+                    self.ulysses_pg, query, self.scatter_idx, self.gather_idx
+                )
+                key_layer = SeqAllToAll4D.apply(
+                    self.ulysses_pg, key, self.scatter_idx, self.gather_idx
+                )
+                value_layer = SeqAllToAll4D.apply(
+                    self.ulysses_pg, value, self.scatter_idx, self.gather_idx
+                )
+
+        """
+        APPLY COMPACT ATTN
+        """
+        if self.idx is None:
+            global ATTN_LAYER_IDX
+            self.idx = ATTN_LAYER_IDX
+            ATTN_LAYER_IDX += 1
+        
+        """
+        Collector for Q, K, V, Layer/Step Specific
+        """
+        from xfuser.compact.main import compact_config, compact_get_step
+        from xfuser.collector.collector import collect
+        collect(query_layer, "q", compact_get_step(), self.idx)
+        collect(key_layer, "k", compact_get_step(), self.idx)
+        collect(value_layer, "v", compact_get_step(), self.idx)
+        
+        if compact_config().enabled:
+            # assert not self.use_kv_cache
+            out = self.ring_attn_fn(
+                query_layer,
+                key_layer,
+                value_layer,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_attn_probs=return_attn_probs,
+                group=self.ring_pg,
+                attn_layer=attn if self.use_kv_cache else None,
+                joint_tensor_key=joint_tensor_key,
+                joint_tensor_value=joint_tensor_value,
+                joint_strategy=joint_strategy,
+                mod_idx=self.idx,
+                current_iter=compact_get_step()
+            )
         else:
-            query_layer = SeqAllToAll4D.apply(
-                self.ulysses_pg, query, self.scatter_idx, self.gather_idx
+            #print("important: using yunchang ring attn without compact func in xFuserLongContextAttention")
+            out = self.ring_attn_fn(
+                query_layer,
+                key_layer,
+                value_layer,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_attn_probs=return_attn_probs,
+                group=self.ring_pg,
+                attn_layer=attn if self.use_kv_cache else None,
+                joint_tensor_key=joint_tensor_key,
+                joint_tensor_value=joint_tensor_value,
+                joint_strategy=joint_strategy,
             )
-            key_layer = SeqAllToAll4D.apply(
-                self.ulysses_pg, key, self.scatter_idx, self.gather_idx
-            )
-            value_layer = SeqAllToAll4D.apply(
-                self.ulysses_pg, value, self.scatter_idx, self.gather_idx
-            )
-
-        out = self.ring_attn_fn(
-            query_layer,
-            key_layer,
-            value_layer,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_attn_probs=return_attn_probs,
-            group=self.ring_pg,
-            attn_type=self.attn_type,
-            attn_processor=self.attn_processor,
-            attn_layer=attn if self.use_kv_cache else None,
-            joint_tensor_key=joint_tensor_key,
-            joint_tensor_value=joint_tensor_value,
-            joint_strategy=joint_strategy,
-            q_descale=self.q_descale,
-            k_descale=self.k_descale,
-            v_descale=self.v_descale,
-        )
 
         if type(out) == tuple:
             context_layer, _, _ = out
@@ -225,107 +235,10 @@ class xFuserLongContextAttention(LongContextAttention):
 
         # (bs, seq_len, head_cnt/N, head_size) -> (bs, seq_len/N, head_cnt, head_size)
         # scatter 1, gather 2
-        output = SeqAllToAll4D.apply(
-            self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx
-        )
+        with Profiler.instance().scope("ulysses.all2all"):
+            output = SeqAllToAll4D.apply(
+                self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx
+            )
 
         # out e.g., [s/p::h]
-        return output
-
-class xFuserSanaLinearLongContextAttention(xFuserLongContextAttention):
-    def __init__(self,
-                 scatter_idx: int = 2,
-                 gather_idx: int = 1,
-                 ring_impl_type: str = "basic",
-                 use_pack_qkv: bool = False,
-                 use_kv_cache: bool = False,
-                 attn_type: AttnType = None,
-                 attn_processor: torch.nn.Module = None):
-        super().__init__(scatter_idx, gather_idx, ring_impl_type, use_pack_qkv, use_kv_cache, attn_type, attn_processor)
-        # TODO need to check the attn_type
-        from xfuser.core.long_ctx_attention.ring import xdit_sana_ring_flash_attn_func
-        self.ring_attn_fn = xdit_sana_ring_flash_attn_func
-        # self.ring_attn_fn = xdit_sana_linear_ring_flash_attn_func
-        self.ring_world_size = get_ring_parallel_world_size()
-
-    def forward(
-        self,
-        attn,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        *,
-        attn_mask: Tensor = None,
-        dropout_p=0.0,
-        softmax_scale=None,
-        causal=False,
-        window_size=(-1, -1),
-        alibi_slopes=None,
-        deterministic=False,
-        return_attn_probs=False,
-    ) -> Tensor:
-
-        """forward
-
-        Arguments:
-            attn (Attention): the attention module
-            query (Tensor): query input to the layer
-            key (Tensor): key input to the layer
-            value (Tensor): value input to the layer
-            args: other args,
-            joint_tensor_query: Tensor = None, a replicated tensor among processes appended to the front or rear of query, depends the joint_strategy  
-            joint_tensor_key: Tensor = None, a replicated tensor among processes appended to the front or rear of key, depends the joint_strategy
-            joint_tensor_value: Tensor = None, a replicated tensor among processes appended to the front or rear of value, depends the joint_strategy,
-            *args: the args same as flash_attn_interface
-            joint_strategy: str = "none", the joint strategy for joint attention, currently only support "front" and "rear"
-
-        Returns:
-            * output (Tensor): context output
-        """
-        # (bs, seq_len/N, head_cnt, head_size)
-
-        # 3 X (bs, seq_len/N, head_cnt, head_size) -> 3 X (bs, seq_len, head_cnt/N, head_size)
-        # scatter 2, gather 1
-        if self.use_pack_qkv:
-            # (3*bs, seq_len/N, head_cnt, head_size)
-            qkv = torch.cat([query, key, value]).contiguous()
-            # (3*bs, seq_len, head_cnt/N, head_size)
-            qkv = SeqAllToAll4D.apply(
-                self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx
-            )
-            qkv = torch.chunk(qkv, 3, dim=0)
-            query_layer, key_layer, value_layer = qkv
-
-        else:
-            query_layer = SeqAllToAll4D.apply(
-                self.ulysses_pg, query, self.scatter_idx, self.gather_idx
-            )
-            key_layer = SeqAllToAll4D.apply(
-                self.ulysses_pg, key, self.scatter_idx, self.gather_idx
-            )
-            value_layer = SeqAllToAll4D.apply(
-                self.ulysses_pg, value, self.scatter_idx, self.gather_idx
-            )
-        
-        out = self.ring_attn_fn(
-            query_layer,
-            key_layer,
-            value_layer,
-            group=self.ring_pg,
-            attn_layer=attn if self.use_kv_cache else None,
-        )
-        out = out.transpose(1, 2)
-        
-        if isinstance(out, tuple):
-            context_layer, _, _ = out
-        else:
-            context_layer = out
-
-        # scatter 1, gather 2
-        output: Tensor = SeqAllToAll4D.apply(
-            self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx
-        )
-        
-        output = output.flatten(2, 3)
-
         return output
